@@ -5,11 +5,18 @@
 (define-constant ERR_INVALID_RATING (err u103))
 (define-constant ERR_INVALID_DURATION (err u104))
 (define-constant ERR_LEASE_ACTIVE (err u105))
+(define-constant ERR_DISPUTE_NOT_FOUND (err u106))
+(define-constant ERR_DISPUTE_CLOSED (err u107))
+(define-constant ERR_ALREADY_VOTED (err u108))
+(define-constant ERR_INSUFFICIENT_STAKE (err u109))
+(define-constant ERR_DISPUTE_STILL_ACTIVE (err u110))
 
 (define-non-fungible-token rentproof-nft uint)
 
 (define-data-var next-nft-id uint u1)
 (define-data-var contract-uri (string-ascii 256) "https://rentproof.io/metadata/")
+(define-data-var next-dispute-id uint u1)
+(define-data-var dispute-resolution-stake uint u1000)
 
 (define-map user-profiles principal {
     total-leases: uint,
@@ -41,6 +48,37 @@
 })
 
 (define-map user-lease-history principal (list 50 uint))
+
+(define-map dispute-records uint {
+    dispute-type: (string-ascii 50),
+    complainant: principal,
+    respondent: principal,
+    lease-id: uint,
+    description: (string-ascii 1000),
+    evidence-hash: (string-ascii 64),
+    status: (string-ascii 20),
+    created-at: uint,
+    resolution-deadline: uint,
+    resolved-at: (optional uint),
+    resolution: (string-ascii 500),
+    complainant-satisfied: (optional bool),
+    respondent-satisfied: (optional bool)
+})
+
+(define-map dispute-votes uint {
+    total-votes: uint,
+    favor-complainant: uint,
+    favor-respondent: uint,
+    neutral: uint
+})
+
+(define-map user-dispute-votes { user: principal, dispute-id: uint } {
+    vote: (string-ascii 20),
+    stake-amount: uint,
+    voted-at: uint
+})
+
+(define-map user-dispute-history principal (list 20 uint))
 
 (define-public (create-lease-record 
     (tenant principal)
@@ -140,6 +178,137 @@
         (var-set contract-uri new-uri)
         (ok true)))
 
+(define-public (create-dispute 
+    (dispute-type (string-ascii 50))
+    (respondent principal)
+    (lease-id uint)
+    (description (string-ascii 1000))
+    (evidence-hash (string-ascii 64)))
+    (let ((dispute-id (var-get next-dispute-id))
+          (lease-data (unwrap! (map-get? lease-records lease-id) ERR_NOT_FOUND))
+          (resolution-blocks u1440))
+        
+        (asserts! (or (is-eq tx-sender (get landlord lease-data))
+                     (is-eq tx-sender (get tenant lease-data))) ERR_UNAUTHORIZED)
+        (asserts! (or (is-eq respondent (get landlord lease-data))
+                     (is-eq respondent (get tenant lease-data))) ERR_UNAUTHORIZED)
+        (asserts! (not (is-eq tx-sender respondent)) ERR_UNAUTHORIZED)
+        
+        (map-set dispute-records dispute-id {
+            dispute-type: dispute-type,
+            complainant: tx-sender,
+            respondent: respondent,
+            lease-id: lease-id,
+            description: description,
+            evidence-hash: evidence-hash,
+            status: "open",
+            created-at: stacks-block-height,
+            resolution-deadline: (+ stacks-block-height resolution-blocks),
+            resolved-at: none,
+            resolution: "",
+            complainant-satisfied: none,
+            respondent-satisfied: none
+        })
+        
+        (map-set dispute-votes dispute-id {
+            total-votes: u0,
+            favor-complainant: u0,
+            favor-respondent: u0,
+            neutral: u0
+        })
+        
+        (add-dispute-to-history tx-sender dispute-id)
+        (add-dispute-to-history respondent dispute-id)
+        
+        (var-set next-dispute-id (+ dispute-id u1))
+        (ok dispute-id)))
+
+(define-public (vote-on-dispute 
+    (dispute-id uint)
+    (vote (string-ascii 20))
+    (stake-amount uint))
+    (let ((dispute-data (unwrap! (map-get? dispute-records dispute-id) ERR_DISPUTE_NOT_FOUND))
+          (current-votes (unwrap! (map-get? dispute-votes dispute-id) ERR_DISPUTE_NOT_FOUND))
+          (vote-key { user: tx-sender, dispute-id: dispute-id })
+          (min-stake (var-get dispute-resolution-stake)))
+        
+        (asserts! (is-eq (get status dispute-data) "open") ERR_DISPUTE_CLOSED)
+        (asserts! (< stacks-block-height (get resolution-deadline dispute-data)) ERR_DISPUTE_CLOSED)
+        (asserts! (>= stake-amount min-stake) ERR_INSUFFICIENT_STAKE)
+        (asserts! (is-none (map-get? user-dispute-votes vote-key)) ERR_ALREADY_VOTED)
+        (asserts! (not (is-eq tx-sender (get complainant dispute-data))) ERR_UNAUTHORIZED)
+        (asserts! (not (is-eq tx-sender (get respondent dispute-data))) ERR_UNAUTHORIZED)
+        (asserts! (or (is-eq vote "favor-complainant") 
+                     (is-eq vote "favor-respondent") 
+                     (is-eq vote "neutral")) ERR_INVALID_RATING)
+        
+        (map-set user-dispute-votes vote-key {
+            vote: vote,
+            stake-amount: stake-amount,
+            voted-at: stacks-block-height
+        })
+        
+        (let ((new-total (+ (get total-votes current-votes) u1)))
+            (if (is-eq vote "favor-complainant")
+                (map-set dispute-votes dispute-id (merge current-votes {
+                    total-votes: new-total,
+                    favor-complainant: (+ (get favor-complainant current-votes) u1)
+                }))
+                (if (is-eq vote "favor-respondent")
+                    (map-set dispute-votes dispute-id (merge current-votes {
+                        total-votes: new-total,
+                        favor-respondent: (+ (get favor-respondent current-votes) u1)
+                    }))
+                    (map-set dispute-votes dispute-id (merge current-votes {
+                        total-votes: new-total,
+                        neutral: (+ (get neutral current-votes) u1)
+                    })))))
+        (ok true)))
+
+(define-public (resolve-dispute 
+    (dispute-id uint)
+    (resolution (string-ascii 500)))
+    (let ((dispute-data (unwrap! (map-get? dispute-records dispute-id) ERR_DISPUTE_NOT_FOUND))
+          (vote-data (unwrap! (map-get? dispute-votes dispute-id) ERR_DISPUTE_NOT_FOUND)))
+        
+        (asserts! (is-eq (get status dispute-data) "open") ERR_DISPUTE_CLOSED)
+        (asserts! (>= stacks-block-height (get resolution-deadline dispute-data)) ERR_DISPUTE_STILL_ACTIVE)
+        (asserts! (or (is-eq tx-sender CONTRACT_OWNER)
+                     (is-eq tx-sender (get complainant dispute-data))
+                     (is-eq tx-sender (get respondent dispute-data))) ERR_UNAUTHORIZED)
+        
+        (let ((winning-decision (determine-winning-vote vote-data)))
+            (map-set dispute-records dispute-id (merge dispute-data {
+                status: "resolved",
+                resolved-at: (some stacks-block-height),
+                resolution: resolution
+            })))
+        (ok true)))
+
+(define-public (mark-dispute-satisfaction 
+    (dispute-id uint)
+    (is-satisfied bool))
+    (let ((dispute-data (unwrap! (map-get? dispute-records dispute-id) ERR_DISPUTE_NOT_FOUND)))
+        
+        (asserts! (is-eq (get status dispute-data) "resolved") ERR_DISPUTE_NOT_FOUND)
+        (asserts! (or (is-eq tx-sender (get complainant dispute-data))
+                     (is-eq tx-sender (get respondent dispute-data))) ERR_UNAUTHORIZED)
+        
+        (if (is-eq tx-sender (get complainant dispute-data))
+            (map-set dispute-records dispute-id (merge dispute-data {
+                complainant-satisfied: (some is-satisfied)
+            }))
+            (map-set dispute-records dispute-id (merge dispute-data {
+                respondent-satisfied: (some is-satisfied)
+            })))
+        (ok true)))
+
+(define-public (set-dispute-stake (new-stake uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (var-set dispute-resolution-stake new-stake)
+        (ok true)))
+
 (define-read-only (get-lease-record (lease-id uint))
     (map-get? lease-records lease-id))
 
@@ -157,6 +326,24 @@
 
 (define-read-only (get-user-lease-history (user principal))
     (default-to (list) (map-get? user-lease-history user)))
+
+(define-read-only (get-dispute-record (dispute-id uint))
+    (map-get? dispute-records dispute-id))
+
+(define-read-only (get-dispute-votes (dispute-id uint))
+    (map-get? dispute-votes dispute-id))
+
+(define-read-only (get-user-dispute-vote (user principal) (dispute-id uint))
+    (map-get? user-dispute-votes { user: user, dispute-id: dispute-id }))
+
+(define-read-only (get-user-dispute-history (user principal))
+    (default-to (list) (map-get? user-dispute-history user)))
+
+(define-read-only (get-dispute-stake-requirement)
+    (var-get dispute-resolution-stake))
+
+(define-read-only (get-next-dispute-id)
+    (var-get next-dispute-id))
 
 (define-read-only (get-reputation-score (user principal))
     (let ((profile (get-user-profile user)))
@@ -206,6 +393,23 @@
     (let ((current-history (get-user-lease-history user)))
         (map-set user-lease-history user 
             (unwrap-panic (as-max-len? (append current-history lease-id) u50)))))
+
+(define-private (add-dispute-to-history (user principal) (dispute-id uint))
+    (let ((current-history (get-user-dispute-history user)))
+        (map-set user-dispute-history user 
+            (unwrap-panic (as-max-len? (append current-history dispute-id) u20)))))
+
+(define-private (determine-winning-vote (vote-data { total-votes: uint, favor-complainant: uint, favor-respondent: uint, neutral: uint }))
+    (let ((complainant-votes (get favor-complainant vote-data))
+          (respondent-votes (get favor-respondent vote-data))
+          (neutral-votes (get neutral vote-data)))
+        (if (> complainant-votes respondent-votes)
+            (if (> complainant-votes neutral-votes)
+                "favor-complainant"
+                "neutral")
+            (if (> respondent-votes neutral-votes)
+                "favor-respondent"
+                "neutral"))))
 
 (define-private (uint-to-ascii (value uint))
     (if (<= value u9)
