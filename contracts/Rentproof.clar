@@ -10,6 +10,13 @@
 (define-constant ERR_ALREADY_VOTED (err u108))
 (define-constant ERR_INSUFFICIENT_STAKE (err u109))
 (define-constant ERR_DISPUTE_STILL_ACTIVE (err u110))
+(define-constant ERR_ESCROW_NOT_FOUND (err u111))
+(define-constant ERR_ESCROW_ALREADY_EXISTS (err u112))
+(define-constant ERR_INSUFFICIENT_FUNDS (err u113))
+(define-constant ERR_ESCROW_NOT_ACTIVE (err u114))
+(define-constant ERR_CLAIM_PERIOD_EXPIRED (err u115))
+(define-constant ERR_ALREADY_CLAIMED (err u116))
+(define-constant ERR_INVALID_CLAIM_AMOUNT (err u117))
 
 (define-non-fungible-token rentproof-nft uint)
 
@@ -17,6 +24,7 @@
 (define-data-var contract-uri (string-ascii 256) "https://rentproof.io/metadata/")
 (define-data-var next-dispute-id uint u1)
 (define-data-var dispute-resolution-stake uint u1000)
+(define-data-var next-escrow-id uint u1)
 
 (define-map user-profiles principal {
     total-leases: uint,
@@ -79,6 +87,34 @@
 })
 
 (define-map user-dispute-history principal (list 20 uint))
+
+(define-map escrow-records uint {
+    lease-id: uint,
+    landlord: principal,
+    tenant: principal,
+    deposit-amount: uint,
+    status: (string-ascii 20),
+    created-at: uint,
+    claim-deadline: uint,
+    total-claims: uint,
+    released-amount: uint,
+    auto-release-date: uint
+})
+
+(define-map damage-claims uint {
+    escrow-id: uint,
+    claimant: principal,
+    claim-type: (string-ascii 50),
+    description: (string-ascii 500),
+    evidence-hash: (string-ascii 64),
+    requested-amount: uint,
+    status: (string-ascii 20),
+    created-at: uint,
+    approved-amount: uint,
+    processed-at: (optional uint)
+})
+
+(define-map escrow-balances uint uint)
 
 (define-public (create-lease-record 
     (tenant principal)
@@ -309,6 +345,150 @@
         (var-set dispute-resolution-stake new-stake)
         (ok true)))
 
+(define-public (create-escrow 
+    (lease-id uint)
+    (deposit-amount uint))
+    (let ((escrow-id (var-get next-escrow-id))
+          (lease-data (unwrap! (map-get? lease-records lease-id) ERR_NOT_FOUND))
+          (hold-period u2016))
+        
+        (asserts! (> deposit-amount u0) ERR_INVALID_CLAIM_AMOUNT)
+        (asserts! (is-eq tx-sender (get tenant lease-data)) ERR_UNAUTHORIZED)
+        (asserts! (is-none (get-escrow-by-lease lease-id)) ERR_ESCROW_ALREADY_EXISTS)
+        (asserts! (>= (stx-get-balance tx-sender) deposit-amount) ERR_INSUFFICIENT_FUNDS)
+        
+        (try! (stx-transfer? deposit-amount tx-sender (as-contract tx-sender)))
+        
+        (map-set escrow-records escrow-id {
+            lease-id: lease-id,
+            landlord: (get landlord lease-data),
+            tenant: (get tenant lease-data),
+            deposit-amount: deposit-amount,
+            status: "active",
+            created-at: stacks-block-height,
+            claim-deadline: (+ (get lease-end lease-data) u720),
+            total-claims: u0,
+            released-amount: u0,
+            auto-release-date: (+ (get lease-end lease-data) hold-period)
+        })
+        
+        (map-set escrow-balances escrow-id deposit-amount)
+        (var-set next-escrow-id (+ escrow-id u1))
+        (ok escrow-id)))
+
+(define-public (submit-damage-claim 
+    (escrow-id uint)
+    (claim-type (string-ascii 50))
+    (description (string-ascii 500))
+    (evidence-hash (string-ascii 64))
+    (requested-amount uint))
+    (let ((escrow-data (unwrap! (map-get? escrow-records escrow-id) ERR_ESCROW_NOT_FOUND))
+          (available-balance (unwrap! (map-get? escrow-balances escrow-id) ERR_ESCROW_NOT_FOUND)))
+        
+        (asserts! (is-eq (get status escrow-data) "active") ERR_ESCROW_NOT_ACTIVE)
+        (asserts! (is-eq tx-sender (get landlord escrow-data)) ERR_UNAUTHORIZED)
+        (asserts! (< stacks-block-height (get claim-deadline escrow-data)) ERR_CLAIM_PERIOD_EXPIRED)
+        (asserts! (and (> requested-amount u0) (<= requested-amount available-balance)) ERR_INVALID_CLAIM_AMOUNT)
+        
+        (let ((claim-id (+ escrow-id u10000)))
+            (map-set damage-claims claim-id {
+                escrow-id: escrow-id,
+                claimant: tx-sender,
+                claim-type: claim-type,
+                description: description,
+                evidence-hash: evidence-hash,
+                requested-amount: requested-amount,
+                status: "pending",
+                created-at: stacks-block-height,
+                approved-amount: u0,
+                processed-at: none
+            })
+            
+            (map-set escrow-records escrow-id (merge escrow-data {
+                total-claims: (+ (get total-claims escrow-data) u1)
+            }))
+            (ok claim-id))))
+
+(define-public (approve-damage-claim 
+    (claim-id uint)
+    (approved-amount uint))
+    (let ((claim-data (unwrap! (map-get? damage-claims claim-id) ERR_NOT_FOUND))
+          (escrow-data (unwrap! (map-get? escrow-records (get escrow-id claim-data)) ERR_ESCROW_NOT_FOUND))
+          (available-balance (unwrap! (map-get? escrow-balances (get escrow-id claim-data)) ERR_ESCROW_NOT_FOUND)))
+        
+        (asserts! (is-eq tx-sender (get tenant escrow-data)) ERR_UNAUTHORIZED)
+        (asserts! (is-eq (get status claim-data) "pending") ERR_ALREADY_CLAIMED)
+        (asserts! (<= approved-amount (get requested-amount claim-data)) ERR_INVALID_CLAIM_AMOUNT)
+        (asserts! (<= approved-amount available-balance) ERR_INSUFFICIENT_FUNDS)
+        
+        (if (> approved-amount u0)
+            (begin
+                (try! (as-contract (stx-transfer? approved-amount tx-sender (get claimant claim-data))))
+                (map-set escrow-balances (get escrow-id claim-data) (- available-balance approved-amount))
+                (map-set escrow-records (get escrow-id claim-data) (merge escrow-data {
+                    released-amount: (+ (get released-amount escrow-data) approved-amount)
+                })))
+            true)
+        
+        (map-set damage-claims claim-id (merge claim-data {
+            status: "approved",
+            approved-amount: approved-amount,
+            processed-at: (some stacks-block-height)
+        }))
+        (ok true)))
+
+(define-public (reject-damage-claim (claim-id uint))
+    (let ((claim-data (unwrap! (map-get? damage-claims claim-id) ERR_NOT_FOUND))
+          (escrow-data (unwrap! (map-get? escrow-records (get escrow-id claim-data)) ERR_ESCROW_NOT_FOUND)))
+        
+        (asserts! (is-eq tx-sender (get tenant escrow-data)) ERR_UNAUTHORIZED)
+        (asserts! (is-eq (get status claim-data) "pending") ERR_ALREADY_CLAIMED)
+        
+        (map-set damage-claims claim-id (merge claim-data {
+            status: "rejected",
+            processed-at: (some stacks-block-height)
+        }))
+        (ok true)))
+
+(define-public (release-remaining-deposit (escrow-id uint))
+    (let ((escrow-data (unwrap! (map-get? escrow-records escrow-id) ERR_ESCROW_NOT_FOUND))
+          (remaining-balance (unwrap! (map-get? escrow-balances escrow-id) ERR_ESCROW_NOT_FOUND)))
+        
+        (asserts! (is-eq (get status escrow-data) "active") ERR_ESCROW_NOT_ACTIVE)
+        (asserts! (or (is-eq tx-sender (get tenant escrow-data))
+                     (>= stacks-block-height (get auto-release-date escrow-data))) ERR_UNAUTHORIZED)
+        (asserts! (>= stacks-block-height (get claim-deadline escrow-data)) ERR_CLAIM_PERIOD_EXPIRED)
+        
+        (if (> remaining-balance u0)
+            (begin
+                (try! (as-contract (stx-transfer? remaining-balance tx-sender (get tenant escrow-data))))
+                (map-set escrow-balances escrow-id u0))
+            true)
+        
+        (map-set escrow-records escrow-id (merge escrow-data {
+            status: "completed",
+            released-amount: (get deposit-amount escrow-data)
+        }))
+        (ok true)))
+
+(define-public (emergency-release-escrow (escrow-id uint))
+    (let ((escrow-data (unwrap! (map-get? escrow-records escrow-id) ERR_ESCROW_NOT_FOUND))
+          (remaining-balance (unwrap! (map-get? escrow-balances escrow-id) ERR_ESCROW_NOT_FOUND)))
+        
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (asserts! (is-eq (get status escrow-data) "active") ERR_ESCROW_NOT_ACTIVE)
+        
+        (if (> remaining-balance u0)
+            (try! (as-contract (stx-transfer? remaining-balance tx-sender (get tenant escrow-data))))
+            true)
+        
+        (map-set escrow-balances escrow-id u0)
+        (map-set escrow-records escrow-id (merge escrow-data {
+            status: "emergency-released",
+            released-amount: (get deposit-amount escrow-data)
+        }))
+        (ok true)))
+
 (define-read-only (get-lease-record (lease-id uint))
     (map-get? lease-records lease-id))
 
@@ -344,6 +524,22 @@
 
 (define-read-only (get-next-dispute-id)
     (var-get next-dispute-id))
+
+(define-read-only (get-escrow-record (escrow-id uint))
+    (map-get? escrow-records escrow-id))
+
+(define-read-only (get-escrow-balance (escrow-id uint))
+    (map-get? escrow-balances escrow-id))
+
+(define-read-only (get-damage-claim (claim-id uint))
+    (map-get? damage-claims claim-id))
+
+(define-read-only (get-escrow-by-lease (lease-id uint))
+    (get found (fold check-escrow-lease (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10) 
+                     { lease-id: lease-id, found: none, current-id: u1 })))
+
+(define-read-only (get-next-escrow-id)
+    (var-get next-escrow-id))
 
 (define-read-only (get-reputation-score (user principal))
     (let ((profile (get-user-profile user)))
@@ -427,3 +623,20 @@
                         (get r data)) u10))
         }
         data))
+
+(define-private (check-escrow-lease (id uint) (acc { lease-id: uint, found: (optional uint), current-id: uint }))
+    (if (is-some (get found acc))
+        acc
+        (let ((escrow-data (map-get? escrow-records (get current-id acc))))
+            (if (and (is-some escrow-data) 
+                     (is-eq (get lease-id (unwrap-panic escrow-data)) (get lease-id acc)))
+                { lease-id: (get lease-id acc), found: (some (get current-id acc)), current-id: (+ (get current-id acc) u1) }
+                { lease-id: (get lease-id acc), found: none, current-id: (+ (get current-id acc) u1) }))))
+
+
+
+
+
+
+
+
