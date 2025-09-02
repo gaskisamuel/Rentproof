@@ -9,6 +9,10 @@ requirements = []
 path = 'contracts/Rentproof.clar'
 clarity_version = 3
 epoch = 3.1
+[contracts.MaintenanceTracker]
+path = 'contracts/MaintenanceTracker.clar'
+clarity_version = 3
+epoch = 3.1
 [repl.analysis]
 passes = ['check_checker']
 
